@@ -1,0 +1,14 @@
+# Build output and dependencies
+.next
+out
+build
+node_modules
+next-env.d.ts
+
+# Lockfiles — never hand-format
+package-lock.json
+
+# SQL migrations are formatted by hand; Prettier has no SQL parser anyway
+supabase/migrations
+
+.vercel

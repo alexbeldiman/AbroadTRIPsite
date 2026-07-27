@@ -8,7 +8,8 @@ next-env.d.ts
 # Lockfiles — never hand-format
 package-lock.json
 
-# SQL migrations are formatted by hand; Prettier has no SQL parser anyway
+# SQL is formatted by hand; Prettier has no SQL parser anyway
 supabase/migrations
+supabase/tests
 
 .vercel

@@ -104,6 +104,11 @@ $$;
 --   dave   declined invitee on alice's private trip
 --   erin   pending  invitee on alice's private trip
 --   frank  accepted companion on alice's public trip
+--   grace  pending  invitee on alice's private trip — accepts, in the transition tests
+--   heidi  pending  invitee on alice's private trip — declines, in the transition tests
+--
+-- Every trip also gets exactly one trip_segments row, so the child-table parity
+-- check can compare "can see trip" against "can see its segments" per user.
 -- ---------------------------------------------------------------------------
 
 do $$
@@ -114,7 +119,9 @@ declare
   dave  uuid := '00000000-0000-4000-a000-000000000004';
   erin  uuid := '00000000-0000-4000-a000-000000000005';
   frank uuid := '00000000-0000-4000-a000-000000000006';
-  ids   uuid[] := array[alice, bob, carol, dave, erin, frank];
+  grace uuid := '00000000-0000-4000-a000-000000000007';
+  heidi uuid := '00000000-0000-4000-a000-000000000008';
+  ids   uuid[] := array[alice, bob, carol, dave, erin, frank, grace, heidi];
   u     uuid;
   n     integer;
 begin
@@ -143,10 +150,10 @@ begin
   end loop;
 
   select count(*) into n from public.profiles where id = any(ids);
-  if n <> 6 then
+  if n <> array_length(ids, 1) then
     raise exception
-      'Fixture failed: expected 6 profiles from the signup trigger, got %. '
-      'The handle_new_user trigger may not be installed.', n;
+      'Fixture failed: expected % profiles from the signup trigger, got %. '
+      'The handle_new_user trigger may not be installed.', array_length(ids, 1), n;
   end if;
 
   -- Account-level visibility.
@@ -164,14 +171,21 @@ begin
   insert into public.trips (id, owner_id, title, visibility, status) values
     ('00000000-0000-4000-c000-000000000005', carol, 'Carol public', 'public', 'planned');
 
-  -- Participants on Alice's PRIVATE trip: one declined, one still pending.
+  -- Participants on Alice's PRIVATE trip: one declined, three pending.
   insert into public.trip_participants (trip_id, user_id, role, invite_status) values
-    ('00000000-0000-4000-c000-000000000004', dave, 'companion', 'declined'),
-    ('00000000-0000-4000-c000-000000000004', erin, 'companion', 'invited');
+    ('00000000-0000-4000-c000-000000000004', dave,  'companion', 'declined'),
+    ('00000000-0000-4000-c000-000000000004', erin,  'companion', 'invited'),
+    ('00000000-0000-4000-c000-000000000004', grace, 'companion', 'invited'),
+    ('00000000-0000-4000-c000-000000000004', heidi, 'companion', 'invited');
 
   -- Frank is an accepted companion on Alice's PUBLIC trip, for the write test.
   insert into public.trip_participants (trip_id, user_id, role, invite_status) values
     ('00000000-0000-4000-c000-000000000001', frank, 'companion', 'accepted');
+
+  -- Exactly one segment per trip, so child-table access can be compared against
+  -- parent-trip access one-for-one.
+  insert into public.trip_segments (trip_id, type, status, provider)
+  select id, 'flight', 'wanted', 'Ryanair' from public.trips;
 
   -- One destination row so the world-readable test has something to find.
   insert into public.destinations (id, city, country, region)
@@ -192,6 +206,8 @@ declare
   dave      uuid := '00000000-0000-4000-a000-000000000004';
   erin      uuid := '00000000-0000-4000-a000-000000000005';
   frank     uuid := '00000000-0000-4000-a000-000000000006';
+  grace     uuid := '00000000-0000-4000-a000-000000000007';
+  heidi     uuid := '00000000-0000-4000-a000-000000000008';
 
   t_public    uuid := '00000000-0000-4000-c000-000000000001';
   t_followers uuid := '00000000-0000-4000-c000-000000000002';
@@ -199,9 +215,10 @@ declare
   t_private   uuid := '00000000-0000-4000-c000-000000000004';
   t_carol     uuid := '00000000-0000-4000-c000-000000000005';
 
-  visible   integer;
-  can_see   boolean;
-  n         integer;
+  visible       integer;
+  can_see       boolean;
+  n             integer;
+  dave_status text;
 begin
   -- =========================================================================
   -- 1. A non-follower sees only Alice's 'public' trip.
@@ -331,10 +348,8 @@ begin
     'needs to see what they are deciding about'
   );
 
-  -- Child tables must inherit that access.
-  insert into public.trip_segments (trip_id, type, status, provider)
-  values (t_private, 'flight', 'wanted', 'Ryanair');
-
+  -- Child tables must inherit that access. The segment was created in the
+  -- fixture, one per trip.
   perform public._rls_become(erin);
   select count(*) into n from public.trip_segments where trip_id = t_private;
   execute 'reset role';
@@ -380,7 +395,8 @@ begin
   execute 'reset role';
   perform public._rls_assert(
     'companion CAN read trip_segments on a trip they can see',
-    n >= 0, true
+    n = 1, true,
+    n || ' segment(s) visible — the denied insert above must not have landed'
   );
 
   -- =========================================================================
@@ -506,6 +522,178 @@ begin
     'anon sees ' || visible || ' of alice''s 4 trips'
   );
 
+  -- =========================================================================
+  -- 11. Child-table parity after the can_read_trip_row refactor.
+  --
+  --     The trips SELECT policy calls can_read_trip_row() directly; the
+  --     trip_segments policy goes through the can_read_trip() wrapper. Those are
+  --     two different code paths to the same rule, so for every (user, trip)
+  --     pair the answers must match exactly. Any disagreement means the refactor
+  --     changed behaviour on one path.
+  --
+  --     Every trip has exactly one segment, so "sees the trip" must equal
+  --     "sees 1 segment" in all 30 combinations.
+  -- =========================================================================
+  declare
+    u          uuid;
+    t          uuid;
+    sees_trip  boolean;
+    sees_seg   integer;
+    mismatches integer := 0;
+    checked    integer := 0;
+  begin
+    foreach u in array array[alice, bob, carol, dave, erin, frank] loop
+      foreach t in array array[t_public, t_followers, t_custom, t_private, t_carol] loop
+        perform public._rls_become(u);
+        select exists (select 1 from public.trips where id = t) into sees_trip;
+        select count(*) into sees_seg from public.trip_segments where trip_id = t;
+        execute 'reset role';
+
+        checked := checked + 1;
+        if sees_trip <> (sees_seg = 1) then
+          mismatches := mismatches + 1;
+        end if;
+      end loop;
+    end loop;
+
+    perform public._rls_assert(
+      'child-table reads resolve identically to parent after refactor',
+      mismatches = 0, true,
+      checked || ' user/trip pairs checked, ' || mismatches || ' mismatch(es)'
+    );
+  end;
+
+  -- =========================================================================
+  -- 12. Participant invite transitions — the one-way door.
+  --
+  --     Postgres evaluates `using` against the OLD row and `with check` against
+  --     the NEW row. So a blocked transition shows up two different ways:
+  --       - blocked by `using`      -> row invisible, 0 rows updated, NO error
+  --       - blocked by `with check` -> error, statement aborted
+  --     A declined invitee is blocked by `using`, so these assert row counts.
+  -- =========================================================================
+
+  -- Dave declined. He must not be able to let himself back in.
+  perform public._rls_become(dave);
+  update public.trip_participants set invite_status = 'accepted'
+   where trip_id = t_private and user_id = dave;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'declined invitee CANNOT set their own row back to accepted',
+    n = 0, true,
+    n || ' row(s) updated — blocked by USING, so silently filtered'
+  );
+
+  select invite_status::text into dave_status
+    from public.trip_participants where trip_id = t_private and user_id = dave;
+  perform public._rls_assert(
+    'declined invitee row is still declined afterwards',
+    dave_status = 'declined', true,
+    'status is ' || dave_status
+  );
+
+  perform public._rls_become(dave);
+  update public.trip_participants set invite_status = 'invited'
+   where trip_id = t_private and user_id = dave;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'declined invitee CANNOT set their own row back to invited',
+    n = 0, true,
+    n || ' row(s) updated'
+  );
+
+  -- And still no read access after trying.
+  perform public._rls_become(dave);
+  select exists (select 1 from public.trips where id = t_private) into can_see;
+  execute 'reset role';
+  perform public._rls_assert(
+    'declined invitee still has no read access after attempting to restore it',
+    can_see, false
+  );
+
+  -- Grace is pending. She may accept.
+  perform public._rls_become(grace);
+  update public.trip_participants set invite_status = 'accepted'
+   where trip_id = t_private and user_id = grace;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'pending invitee CAN accept their own row',
+    n = 1, true,
+    n || ' row(s) updated'
+  );
+
+  -- Heidi is pending. She may decline.
+  perform public._rls_become(heidi);
+  update public.trip_participants set invite_status = 'declined'
+   where trip_id = t_private and user_id = heidi;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'pending invitee CAN decline their own row',
+    n = 1, true,
+    n || ' row(s) updated'
+  );
+
+  -- Having accepted, Grace can no longer move her own row — it is terminal.
+  perform public._rls_become(grace);
+  update public.trip_participants set invite_status = 'declined'
+   where trip_id = t_private and user_id = grace;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'accepted invitee CANNOT move their own row again',
+    n = 0, true,
+    n || ' row(s) updated — transition is one-way'
+  );
+
+  -- A participant must not touch anyone else's row.
+  perform public._rls_become(erin);
+  update public.trip_participants set invite_status = 'declined'
+   where trip_id = t_private and user_id = grace;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'participant CANNOT update another participant''s row',
+    n = 0, true,
+    n || ' row(s) updated'
+  );
+
+  -- The owner can move any row, including re-inviting someone who declined.
+  perform public._rls_become(alice);
+  update public.trip_participants set invite_status = 'invited'
+   where trip_id = t_private and user_id = dave;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'trip owner CAN re-invite a declined participant',
+    n = 1, true,
+    n || ' row(s) updated'
+  );
+
+  -- And that re-invitation actually restores read access.
+  perform public._rls_become(dave);
+  select exists (select 1 from public.trips where id = t_private) into can_see;
+  execute 'reset role';
+  perform public._rls_assert(
+    're-invited participant regains read access',
+    can_see, true
+  );
+
+  -- The owner can also move an accepted row, e.g. removing a companion's status.
+  perform public._rls_become(alice);
+  update public.trip_participants set invite_status = 'declined'
+   where trip_id = t_private and user_id = grace;
+  get diagnostics n = row_count;
+  execute 'reset role';
+  perform public._rls_assert(
+    'trip owner CAN change an accepted participant row',
+    n = 1, true,
+    n || ' row(s) updated'
+  );
+
 exception
   when others then
     -- Never leave the session stuck in the authenticated role.
@@ -527,7 +715,9 @@ declare
     '00000000-0000-4000-a000-000000000003'::uuid,
     '00000000-0000-4000-a000-000000000004'::uuid,
     '00000000-0000-4000-a000-000000000005'::uuid,
-    '00000000-0000-4000-a000-000000000006'::uuid
+    '00000000-0000-4000-a000-000000000006'::uuid,
+    '00000000-0000-4000-a000-000000000007'::uuid,
+    '00000000-0000-4000-a000-000000000008'::uuid
   ];
 begin
   -- Cascades through profiles -> trips -> segments/participants/shares.

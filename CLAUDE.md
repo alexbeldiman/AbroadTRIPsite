@@ -195,18 +195,32 @@ inlining one of these back into a subquery, you will reintroduce the recursion.*
 Each is pinned to `search_path = ''` with fully-qualified names so a
 caller-controlled `search_path` cannot redirect it.
 
-| Function                       | Answers                                                                  |
-| ------------------------------ | ------------------------------------------------------------------------ |
-| `is_accepted_follower(a, b)`   | Does a have an _accepted_ follow of b?                                   |
-| `account_is_private(user)`     | Is that account private?                                                 |
-| `is_trip_participant(trip)`    | Is the caller an active participant? (invited or accepted, not declined) |
-| `is_trip_shared_with_me(trip)` | Explicit `custom` share for the caller?                                  |
-| `is_trip_owner(trip)`          | Does the caller own it?                                                  |
-| `can_read_trip(trip)`          | Full read rule, for child tables                                         |
+| Function                            | Answers                                                                  |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| `is_accepted_follower(a, b)`        | Does a have an _accepted_ follow of b?                                   |
+| `account_is_private(user)`          | Is that account private?                                                 |
+| `is_trip_participant(trip)`         | Is the caller an active participant? (invited or accepted, not declined) |
+| `is_trip_shared_with_me(trip)`      | Explicit `custom` share for the caller?                                  |
+| `is_trip_owner(trip)`               | Does the caller own it?                                                  |
+| `can_read_trip_row(id, owner, vis)` | **The** read rule. Single definition.                                    |
+| `can_read_trip(trip)`               | Id-based wrapper over the above, for child tables                        |
 
-Note that the `trips` SELECT policy **inlines** the same logic rather than
-calling `can_read_trip()` — it already has the row, so re-querying would be
-wasteful. **The two must be kept in sync.** Change one, change the other.
+`can_read_trip_row()` is the only place the resolution order is written down.
+The `trips` SELECT policy calls it with the row's own columns, so there is no
+lookup and nothing to keep in sync. `can_read_trip()` is a thin wrapper for
+callers that hold only a `trip_id` — it fetches the row and forwards.
+
+**Change the rule in `can_read_trip_row()` and every table inherits it.**
+
+Two details worth preserving if you touch these:
+
+- `can_read_trip_row()` is deliberately **not** `SECURITY DEFINER`. It reads no
+  tables itself — every table access happens inside the helpers it calls, which
+  are. Keeping it a plain function holds the elevated-privilege surface to the
+  smallest possible set.
+- `can_read_trip()` **must** stay `SECURITY DEFINER`, because it does read
+  `public.trips` directly. Without that, a child table's policy would re-enter
+  the `trips` policy and recurse.
 
 ### Write access
 
@@ -214,8 +228,11 @@ wasteful. **The two must be kept in sync.** Change one, change the other.
 - Trips: owner only.
 - `trip_segments`, `recommendations`: **trip owner only.** Companions cannot edit
   them yet — see open questions.
-- `trip_participants`: owner manages the roster; an invitee may update their own
-  row to accept or decline.
+- `trip_participants`: owner manages the roster. An invitee may answer their own
+  invitation **once** — the policy uses `using` (old row) to require
+  `invite_status = 'invited'` and `with check` (new row) to require a terminal
+  state, making the transition one-way. Re-inviting someone who declined is the
+  owner's action.
 - `follows`: you create follows where you are the follower; only the person being
   followed can flip status to `accepted`. A follower cannot self-approve — that
   is what protects private accounts.
@@ -223,11 +240,13 @@ wasteful. **The two must be kept in sync.** Change one, change the other.
 
 ### Deliberate decisions worth knowing
 
-1. **Pending invitees can read; declined invitees cannot.** An invitee needs to
-   see what they are deciding about, but declining revokes that access —
+1. **Pending invitees can read; declined invitees cannot, and cannot undo it.**
+   An invitee needs to see what they are deciding about, so
    `is_trip_participant()` matches `invite_status in ('invited', 'accepted')`.
-   Note this makes decline a one-way door: the row still exists, so re-inviting
-   someone means the owner updating `invite_status` back to `'invited'`.
+   Declining revokes that access, and the UPDATE policy makes the transition
+   one-way so the invitee cannot flip their own row back and let themselves in
+   again. **Re-inviting is the owner's action** — that is the intended flow, not
+   a limitation.
 2. **An explicit `custom` share outranks a private account.** The owner named
    that person deliberately.
 3. **A participant can set `role = 'owner'` on their own row.** Harmless —
@@ -305,9 +324,11 @@ Unresolved. Do not silently pick an answer — raise it.
 
 - Should companions be able to edit `trip_segments` and `recommendations`? Owner
   only today because loosening is easy and tightening after real data is not.
-- Declining an invitation now revokes read access, and nothing re-grants it. Is
-  re-inviting a declined companion a flow we want? Today it means the owner
-  updating `invite_status` back to `'invited'` on the existing row.
+- Private accounts are currently **undiscoverable** — the `profiles` SELECT
+  policy only exposes a row to strangers when `account_visibility = 'public'`,
+  so nobody can find a private account to send it a follow request. The intended
+  model is Instagram's (handle, display name and avatar public; everything else
+  follower-gated). **Decision pending — see the options write-up.**
 - Should the weekend grid include weekdays, and how are partial weeks at semester
   boundaries handled?
 - Should follower/following lists be public for public accounts?

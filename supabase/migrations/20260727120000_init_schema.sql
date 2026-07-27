@@ -345,13 +345,62 @@ as $$
   );
 $$;
 
--- The full trip read rule in one place.
+-- =============================================================================
+-- THE trip read rule. This is the single definition — everything else delegates.
 --
--- The policy on `trips` itself does NOT call this (it inlines the same logic
--- against the row it already has, which is cheaper). This exists so that
--- trip_segments and recommendations can inherit trip read access by
--- construction — one definition, so child access can never drift out of sync
--- with the parent.
+-- It takes the row's columns rather than an id, so the `trips` SELECT policy can
+-- call it with the row it already has. No lookup, no second definition to keep
+-- in sync.
+--
+-- Deliberately NOT security definer: it touches no tables directly. Every table
+-- read happens inside the security-definer helpers it calls, which is what keeps
+-- the trips <-> trip_participants recursion from forming. Leaving this one as a
+-- plain function keeps the privilege surface as small as possible.
+-- =============================================================================
+create or replace function public.can_read_trip_row(
+  _trip_id    uuid,
+  _owner_id   uuid,
+  _visibility public.trip_visibility
+)
+returns boolean
+language sql
+stable
+set search_path = ''
+as $$
+  select
+    -- The owner always reads their own trips.
+    _owner_id = (select auth.uid())
+
+    -- Active participants always read. Declined invitees do not.
+    or public.is_trip_participant(_trip_id)
+
+    -- Otherwise fall through to the trip's visibility setting.
+    or case _visibility
+         when 'public' then
+           -- A private account's PUBLIC trips are still followers-only.
+           (not public.account_is_private(_owner_id))
+           or public.is_accepted_follower((select auth.uid()), _owner_id)
+         when 'followers' then
+           public.is_accepted_follower((select auth.uid()), _owner_id)
+         when 'custom' then
+           -- An explicit share outranks the account-level default: the owner
+           -- named this person deliberately.
+           public.is_trip_shared_with_me(_trip_id)
+         when 'private' then
+           false
+       end;
+$$;
+
+-- Thin id-based wrapper over can_read_trip_row, for callers that have only a
+-- trip_id — namely the trip_segments and recommendations policies.
+--
+-- This one IS security definer, because it reads public.trips directly and must
+-- bypass RLS to do so. Without that, evaluating a child table's policy would
+-- re-enter the trips policy and recurse.
+--
+-- coalesce guards the no-such-trip case: a bare select returns NULL for a
+-- missing row, and NULL in a policy is indistinguishable from false — but being
+-- explicit costs nothing and documents the intent.
 create or replace function public.can_read_trip(_trip_id uuid)
 returns boolean
 language sql
@@ -359,33 +408,13 @@ stable
 security definer
 set search_path = ''
 as $$
-  select exists (
-    select 1
-    from public.trips t
-    where t.id = _trip_id
-      and (
-        -- The owner always reads their own trips.
-        t.owner_id = (select auth.uid())
-
-        -- Active participants always read. Declined invitees do not.
-        or public.is_trip_participant(t.id)
-
-        -- Otherwise fall through to the trip's visibility setting.
-        or case t.visibility
-             when 'public' then
-               -- A private account's PUBLIC trips are still followers-only.
-               (not public.account_is_private(t.owner_id))
-               or public.is_accepted_follower((select auth.uid()), t.owner_id)
-             when 'followers' then
-               public.is_accepted_follower((select auth.uid()), t.owner_id)
-             when 'custom' then
-               -- An explicit share outranks the account-level default: the owner
-               -- named this person deliberately.
-               public.is_trip_shared_with_me(t.id)
-             when 'private' then
-               false
-           end
-      )
+  select coalesce(
+    (
+      select public.can_read_trip_row(t.id, t.owner_id, t.visibility)
+      from public.trips t
+      where t.id = _trip_id
+    ),
+    false
   );
 $$;
 
@@ -452,34 +481,17 @@ create policy "users update their own profile"
 -- trips — the core privacy rule
 -- ---------------------------------------------------------------------------
 
--- READ: mirrors public.can_read_trip(), but inlined against the row's own
--- columns so it never re-queries `trips`. Keep the two in sync — if you change
--- the resolution order here, change it in can_read_trip() as well.
+-- READ: delegates to the one definition of the rule, passing this row's own
+-- columns. No lookup against `trips` happens here, so there is nothing to keep
+-- in sync and no recursion.
+--
+-- The resolution order — owner, then participant, then visibility — lives in
+-- public.can_read_trip_row(). Change it there and every table that inherits trip
+-- read access follows automatically.
 create policy "trip reads resolve owner, then participant, then visibility"
   on public.trips for select
   to anon, authenticated
-  using (
-    -- 1. The owner always reads their own trips.
-    owner_id = (select auth.uid())
-
-    -- 2. Active participants always read. Declined invitees do not.
-    or public.is_trip_participant(id)
-
-    -- 3. Otherwise, the trip's visibility decides.
-    or case visibility
-         when 'public' then
-           -- Public trip on a public account: readable by anyone, signed in or not.
-           -- Public trip on a PRIVATE account: accepted followers only.
-           (not public.account_is_private(owner_id))
-           or public.is_accepted_follower((select auth.uid()), owner_id)
-         when 'followers' then
-           public.is_accepted_follower((select auth.uid()), owner_id)
-         when 'custom' then
-           public.is_trip_shared_with_me(id)
-         when 'private' then
-           false
-       end
-  );
+  using (public.can_read_trip_row(id, owner_id, visibility));
 
 -- WRITE: owner only. `with check` on INSERT stops a user creating a trip owned
 -- by somebody else; on UPDATE it stops them reassigning ownership away.
@@ -573,22 +585,45 @@ create policy "trip owners invite participants"
   to authenticated
   with check (public.is_trip_owner(trip_id));
 
--- UPDATE: the owner manages the roster, and the invitee updates their own row to
--- accept or decline.
+-- UPDATE: the owner manages the roster; the invitee may only answer a pending
+-- invitation, and only once.
 --
--- Note: an invitee can technically also set role = 'owner' on their own row.
+-- This encodes a ONE-WAY transition. On UPDATE, Postgres evaluates `using`
+-- against the OLD row and `with check` against the NEW row, so:
+--
+--   using       — the participant may only act on a row still sitting at
+--                 'invited'. Once it is 'accepted' or 'declined', the row is
+--                 invisible to them and the UPDATE matches zero rows.
+--   with check  — and they may only move it to a terminal state.
+--
+-- Without the invite_status clause in `using`, a declined invitee still owns
+-- their row and could set invite_status back to 'accepted', walking straight
+-- back into a trip they were removed from. That would silently defeat the
+-- is_trip_participant() check.
+--
+-- Re-inviting someone who declined is therefore the OWNER's action — they pass
+-- is_trip_owner() and can move the row to any state.
+--
+-- Side effect worth knowing: because `with check` requires a terminal state, a
+-- pending invitee cannot update any OTHER column while leaving invite_status at
+-- 'invited' — that attempt raises a policy violation. Participants have no
+-- reason to edit their own row except to answer, so this is intended.
+--
+-- Note: an invitee can still set role = 'owner' on their own row as they accept.
 -- That grants nothing — trip ownership is public.trips.owner_id, and every write
 -- policy checks that column, not this one. This column is display metadata.
 create policy "owners and the invitee update a participant row"
   on public.trip_participants for update
   to authenticated
   using (
-    user_id = (select auth.uid())
-    or public.is_trip_owner(trip_id)
+    public.is_trip_owner(trip_id)
+    -- a participant may only act on a row that is still pending
+    or (user_id = (select auth.uid()) and invite_status = 'invited')
   )
   with check (
-    user_id = (select auth.uid())
-    or public.is_trip_owner(trip_id)
+    public.is_trip_owner(trip_id)
+    -- and may only move it to a terminal state
+    or (user_id = (select auth.uid()) and invite_status in ('accepted', 'declined'))
   );
 
 -- DELETE: the owner removes a companion, or a companion leaves.
